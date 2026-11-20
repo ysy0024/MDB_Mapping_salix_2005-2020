@@ -1,0 +1,631 @@
+# -*- coding: utf-8 -*-
+"""
+Local Willow TIFF + Google Earth Engine CMRSET ETa
+=================================================
+不上传本地 Willow TIFF 到 GEE。GEE 仅按小块下载年度校正 ETa + pixelArea；
+本地 Python 将 Willow==1 与 ETa 对齐后，计算各流域、各年份总耗水量（m3/yr）。
+"""
+
+import os
+import json
+import math
+import time
+import tempfile
+from pathlib import Path
+
+import ee
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import transform_bounds
+from rasterio.windows import Window, transform as window_transform
+from affine import Affine
+import requests
+
+# ============================================================
+# 0. 需要你修改的参数
+# ============================================================
+EE_PROJECT = "ee-yangshu0024"
+# ROOT_DIR = r"F:\train_results\MDB_15_gt0.82\Catchments"
+# FILE_TEMPLATE = "tree_{year}_denoised_final.tif"
+ROOT_DIR = r"E:\train_results\MDBCatchments_Major_gt\Campaspe_gt0.82\clip_v4"
+FILE_TEMPLATE = "tree_{year}_denoised.tif"
+
+YEARS = list(range(2005, 2021))
+# OUTPUT_DIR = r"F:\train_results\MDB_Major_Minor_WaterUse"
+OUTPUT_DIR = r"F:\train_results\WaterUse\Campase_water use"
+
+# 首次建议测试：ONLY_REGIONS=["Kiewa"], ONLY_YEARS=[2019]
+# 全部运行时改回 None
+ONLY_REGIONS = ["Ovens"]
+ONLY_YEARS = None
+
+CMRSET_COLLECTION = "TERN/AET/CMRSET_LANDSAT_V2_2"
+ETA_BAND = "ETa"
+REG_INTERCEPT = -0.5286
+REG_SLOPE = 3.8078
+USE_ETA_CAP = True
+ETA_CAP_MM = 2500.0
+REQUIRE_12_MONTHS = True
+
+BLOCK_SIZE = 512
+MAX_RETRIES = 10
+RETRY_BASE_SECONDS = 5
+RETRY_MAX_SECONDS = 120
+REQUEST_PAUSE_SECONDS = 0.15
+REQUEST_TIMEOUT = (30, 180)
+TEMP_DIR = None
+
+SUMMARY_CSV = os.path.join(OUTPUT_DIR, "willow_total_water_Ovens_use_2005_2020.csv")
+STATE_DIR = os.path.join(OUTPUT_DIR, "_state")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(STATE_DIR, exist_ok=True)
+if TEMP_DIR is not None:
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+session = requests.Session()
+
+
+def init_earth_engine():
+    try:
+        ee.Initialize(project=EE_PROJECT)
+        print(f"✅ Earth Engine initialized: {EE_PROJECT}")
+    except Exception as e:
+        print("Earth Engine 尚未初始化或凭据失效：")
+        print(e)
+        print("\n开始 ee.Authenticate() ...")
+        ee.Authenticate()
+        ee.Initialize(project=EE_PROJECT)
+        print(f"✅ Earth Engine authenticated and initialized: {EE_PROJECT}")
+
+
+def build_annual_eta(year):
+    start = ee.Date.fromYMD(year, 1, 1)
+    end = ee.Date.fromYMD(year + 1, 1, 1)
+    collection = ee.ImageCollection(CMRSET_COLLECTION).filterDate(start, end)
+
+    month_count = int(collection.size().getInfo())
+    if REQUIRE_12_MONTHS and month_count != 12:
+        raise RuntimeError(
+            f"{year}: CMRSET 影像数量={month_count}，不是12个月。"
+            "为避免计算不完整年总量，程序停止。"
+        )
+
+    eta_ref = ee.Image(collection.first()).select(ETA_BAND)
+    eta_ref_proj = eta_ref.projection()
+    proj_info = eta_ref_proj.getInfo()
+
+    def monthly_to_total(img):
+        img = ee.Image(img)
+        t0 = ee.Date(img.get("system:time_start"))
+        t1 = t0.advance(1, "month")
+        days = t1.difference(t0, "day")
+
+        eta_corr_daily = (
+            img.select(ETA_BAND)
+            .multiply(REG_SLOPE)
+            .add(REG_INTERCEPT)
+            .max(0)
+        )
+
+        return (
+            eta_corr_daily
+            .multiply(days)
+            .rename("ETA_monthly_corr_mm")
+            .set("system:time_start", t0.millis())
+        )
+
+    eta_annual = (
+        collection.map(monthly_to_total)
+        .sum()
+        .rename("ETA_annual_mm")
+        .setDefaultProjection(eta_ref_proj)
+    )
+
+    if USE_ETA_CAP:
+        eta_annual = (
+            eta_annual.min(ETA_CAP_MM)
+            .rename("ETA_annual_mm")
+            .setDefaultProjection(eta_ref_proj)
+        )
+
+    pixel_area = ee.Image.pixelArea().rename("pixel_area_m2")
+    download_image = eta_annual.toFloat().addBands(pixel_area.toFloat())
+    return download_image, proj_info, month_count
+
+
+def build_target_grid(src, proj_info):
+    target_crs = proj_info["crs"]
+    tr = proj_info["transform"]
+    if len(tr) != 6:
+        raise RuntimeError(f"Unexpected EE transform: {tr}")
+
+    a, b, c, d, e, f = map(float, tr)
+    if abs(b) > 1e-10 or abs(d) > 1e-10:
+        raise RuntimeError(f"CMRSET reference raster has rotation/shear: {tr}")
+    if a <= 0 or e >= 0:
+        raise RuntimeError(f"Unexpected CMRSET affine direction: {tr}")
+
+    if src.crs is None:
+        raise RuntimeError(f"Willow raster has no CRS: {src.name}")
+
+    if src.crs.to_string() == target_crs:
+        minx, miny, maxx, maxy = (
+            src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top
+        )
+    else:
+        minx, miny, maxx, maxy = transform_bounds(
+            src.crs, target_crs, *src.bounds, densify_pts=21
+        )
+
+    xres = a
+    yres = -e
+    eps = 1e-9
+    col0 = math.floor((minx - c) / xres + eps)
+    col1 = math.ceil((maxx - c) / xres - eps)
+    row0 = math.floor((f - maxy) / yres + eps)
+    row1 = math.ceil((f - miny) / yres - eps)
+
+    width = int(col1 - col0)
+    height = int(row1 - row0)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid target grid: width={width}, height={height}")
+
+    left = c + col0 * xres
+    top = f - row0 * yres
+    target_transform = Affine(xres, 0.0, left, 0.0, -yres, top)
+    return target_crs, target_transform, width, height
+
+
+def affine_to_ee_list(transform):
+    return [
+        float(transform.a), float(transform.b), float(transform.c),
+        float(transform.d), float(transform.e), float(transform.f),
+    ]
+
+
+def download_ee_tile(ee_image, target_crs, tile_transform, width, height):
+    params = {
+        "bands": ["ETA_annual_mm", "pixel_area_m2"],
+        "crs": target_crs,
+        "crs_transform": affine_to_ee_list(tile_transform),
+        "dimensions": [int(width), int(height)],
+        "format": "GEO_TIFF",
+        "filePerBand": False,
+    }
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        tmp_path = None
+        try:
+            url = ee_image.getDownloadURL(params)
+            fd, tmp_path = tempfile.mkstemp(suffix=".tif", dir=TEMP_DIR)
+            os.close(fd)
+
+            with session.get(url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+
+            with rasterio.open(tmp_path) as ds:
+                if ds.count != 2:
+                    raise RuntimeError(f"Expected 2 bands, got {ds.count}")
+                if ds.width != width or ds.height != height:
+                    raise RuntimeError(
+                        f"Downloaded tile size mismatch: expected {width}x{height}, "
+                        f"got {ds.width}x{ds.height}"
+                    )
+                if not ds.transform.almost_equals(tile_transform):
+                    raise RuntimeError(
+                        "Downloaded tile transform mismatch.\n"
+                        f"expected={tile_transform}\nactual={ds.transform}"
+                    )
+            return tmp_path
+
+        except Exception as e:
+            last_error = e
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            if attempt >= MAX_RETRIES:
+                break
+            wait_sec = min(
+                RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                RETRY_MAX_SECONDS
+            )
+            print(f"    ⚠️ download failed ({attempt}/{MAX_RETRIES}): {e}")
+            print(f"    retry after {wait_sec:.0f} s ...")
+            time.sleep(wait_sec)
+
+    raise RuntimeError(
+        f"Tile download failed after {MAX_RETRIES} retries: {last_error}"
+    )
+
+
+def safe_name(text):
+    return (
+        str(text).replace("\\", "_").replace("/", "_")
+        .replace(":", "_").replace(" ", "_")
+    )
+
+
+def state_path(region, year):
+    return os.path.join(STATE_DIR, f"{safe_name(region)}_{year}.json")
+
+
+def atomic_save_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def get_file_signature(path):
+    st = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "size_bytes": int(st.st_size),
+        "mtime": float(st.st_mtime),
+    }
+
+
+def load_or_create_state(
+    region, year, willow_path, target_crs, target_transform,
+    target_width, target_height, total_blocks
+):
+    sp = state_path(region, year)
+    sig = get_file_signature(willow_path)
+
+    new_state = {
+        "region": region,
+        "year": int(year),
+        "willow_path": os.path.abspath(willow_path),
+        "input_signature": sig,
+        "target_crs": target_crs,
+        "target_transform": affine_to_ee_list(target_transform),
+        "target_width": int(target_width),
+        "target_height": int(target_height),
+        "block_size": int(BLOCK_SIZE),
+        "total_blocks": int(total_blocks),
+        "next_block_index": 0,
+        "willow_pixels": 0,
+        "eta_valid_willow_pixels": 0,
+        "eta_missing_willow_pixels": 0,
+        "willow_area_m2": 0.0,
+        "total_water_m3": 0.0,
+        "downloaded_blocks": 0,
+        "zero_willow_blocks_skipped": 0,
+        "completed": False,
+    }
+
+    if not os.path.exists(sp):
+        atomic_save_json(sp, new_state)
+        return new_state, sp
+
+    with open(sp, "r", encoding="utf-8") as f:
+        old = json.load(f)
+
+    if old.get("input_signature") != sig:
+        raise RuntimeError(
+            f"\nCheckpoint input mismatch:\n{sp}\n"
+            "Willow TIFF 已改变；如需重算，请删除该 json 后重跑。"
+        )
+
+    for key in [
+        "target_crs", "target_transform", "target_width", "target_height",
+        "block_size", "total_blocks"
+    ]:
+        if old.get(key) != new_state.get(key):
+            raise RuntimeError(
+                f"\nCheckpoint settings mismatch: {key}\n"
+                f"old={old.get(key)}\nnew={new_state.get(key)}\n"
+                f"请删除 {sp} 后重新计算。"
+            )
+    return old, sp
+
+
+def process_one_region_year(region, year, willow_path, ee_annual_image, proj_info):
+    print("\n" + "=" * 78)
+    print(f"Region: {region} | Year: {year}")
+    print(f"Willow: {willow_path}")
+    print("=" * 78)
+
+    with rasterio.open(willow_path) as src:
+        target_crs, target_transform, width, height = build_target_grid(src, proj_info)
+
+        print("Target CRS:", target_crs)
+        print("Target size:", width, "×", height)
+        print("Target resolution:", abs(target_transform.a), "×", abs(target_transform.e))
+
+        row_offsets = list(range(0, height, BLOCK_SIZE))
+        col_offsets = list(range(0, width, BLOCK_SIZE))
+        total_blocks = len(row_offsets) * len(col_offsets)
+
+        state, sp = load_or_create_state(
+            region, year, willow_path, target_crs, target_transform,
+            width, height, total_blocks
+        )
+        if state["completed"]:
+            print("✅ already completed; skip")
+            return state
+
+        src_nodata = src.nodata if src.nodata is not None else 255
+
+        with WarpedVRT(
+            src,
+            crs=target_crs,
+            transform=target_transform,
+            width=width,
+            height=height,
+            src_nodata=src_nodata,
+            nodata=255,
+            dtype="uint8",
+            resampling=Resampling.nearest
+        ) as willow_vrt:
+
+            block_index = 0
+            for row_off in row_offsets:
+                for col_off in col_offsets:
+                    if block_index < state["next_block_index"]:
+                        block_index += 1
+                        continue
+
+                    win_h = min(BLOCK_SIZE, height - row_off)
+                    win_w = min(BLOCK_SIZE, width - col_off)
+                    win = Window(col_off, row_off, win_w, win_h)
+
+                    willow_arr = willow_vrt.read(1, window=win)
+                    willow_mask = willow_arr == 1
+                    n_willow = int(np.count_nonzero(willow_mask))
+
+                    # 没有 Willow 的块完全不访问 GEE
+                    # 没有 Willow 的块完全不访问 GEE
+                    if n_willow == 0:
+                    
+                        state["zero_willow_blocks_skipped"] += 1
+                        state["next_block_index"] = block_index + 1
+                    
+                        # 每 50 个 block 保存一次 checkpoint，
+                        # 最后一个 block 无论如何都保存
+                        if (
+                            (block_index + 1) % 50 == 0
+                            or
+                            (block_index + 1) == total_blocks
+                        ):
+                            atomic_save_json(sp, state)
+                    
+                            print(
+                                f"  scan block {block_index + 1:,}/{total_blocks:,} | "
+                                f"no-willow skipped="
+                                f"{state['zero_willow_blocks_skipped']:,} | "
+                                f"ET downloaded blocks="
+                                f"{state['downloaded_blocks']:,}"
+                            )
+                    
+                        block_index += 1
+                        continue
+
+                    tile_tr = window_transform(win, target_transform)
+                    tmp_tif = download_ee_tile(
+                        ee_annual_image, target_crs, tile_tr, win_w, win_h
+                    )
+
+                    try:
+                        with rasterio.open(tmp_tif) as eta_ds:
+                            eta = eta_ds.read(1).astype(np.float64)
+                            area = eta_ds.read(2).astype(np.float64)
+
+                            eta_valid = (eta_ds.read_masks(1) > 0) & np.isfinite(eta)
+                            area_valid = (
+                                (eta_ds.read_masks(2) > 0) &
+                                np.isfinite(area) &
+                                (area > 0)
+                            )
+
+                            willow_area_mask = willow_mask & area_valid
+                            valid_willow = willow_mask & eta_valid & area_valid
+                            missing_willow = willow_mask & (~valid_willow)
+
+                            tile_area_m2 = float(np.sum(
+                                area[willow_area_mask], dtype=np.float64
+                            ))
+                            tile_water_m3 = float(np.sum(
+                                (eta[valid_willow] / 1000.0) * area[valid_willow],
+                                dtype=np.float64
+                            ))
+                            n_valid = int(np.count_nonzero(valid_willow))
+                            n_missing = int(np.count_nonzero(missing_willow))
+                    finally:
+                        try:
+                            os.remove(tmp_tif)
+                        except Exception:
+                            pass
+
+                    state["willow_pixels"] += n_willow
+                    state["eta_valid_willow_pixels"] += n_valid
+                    state["eta_missing_willow_pixels"] += n_missing
+                    state["willow_area_m2"] += tile_area_m2
+                    state["total_water_m3"] += tile_water_m3
+                    state["downloaded_blocks"] += 1
+                    state["next_block_index"] = block_index + 1
+                    atomic_save_json(sp, state)
+
+                    print(
+                        f"  block {block_index + 1:,}/{total_blocks:,} | "
+                        f"willow={n_willow:,} | water={tile_water_m3:,.2f} m3 | "
+                        f"cumulative={state['total_water_m3']:,.2f} m3"
+                    )
+                    if REQUEST_PAUSE_SECONDS > 0:
+                        time.sleep(REQUEST_PAUSE_SECONDS)
+                    block_index += 1
+
+        state["completed"] = True
+        if state["willow_area_m2"] > 0:
+            state["willow_area_km2"] = state["willow_area_m2"] / 1_000_000.0
+            state["mean_eta_mm_area_weighted"] = (
+                state["total_water_m3"] * 1000.0 / state["willow_area_m2"]
+            )
+        else:
+            state["willow_area_km2"] = 0.0
+            state["mean_eta_mm_area_weighted"] = None
+
+        atomic_save_json(sp, state)
+
+        print("\n✅ completed")
+        print(f"Willow area = {state['willow_area_km2']:,.6f} km2")
+        print(f"Area-weighted mean ETa = {state['mean_eta_mm_area_weighted']} mm/yr")
+        print(f"Total Willow water use = {state['total_water_m3']:,.3f} m3/yr")
+        if state["eta_missing_willow_pixels"] > 0:
+            print("⚠️ Willow pixels without valid ETa/pixelArea =", state["eta_missing_willow_pixels"])
+        return state
+
+
+def discover_regions():
+    """
+    自动寻找 ROOT_DIR 下所有流域文件夹。
+
+    例如：
+    ROOT_DIR
+    ├── Border
+    ├── Kiewa
+    ├── Warrego
+    └── ...
+    """
+
+    regions = []
+
+    for name in sorted(os.listdir(ROOT_DIR)):
+
+        region_dir = os.path.join(
+            ROOT_DIR,
+            name
+        )
+
+        # 只读取文件夹
+        if not os.path.isdir(region_dir):
+            continue
+
+        # 至少检查是否存在一张年度 tif
+        has_tif = False
+
+        for year in YEARS:
+
+            test_file = os.path.join(
+                region_dir,
+                FILE_TEMPLATE.format(year=year)
+            )
+
+            if os.path.exists(test_file):
+                has_tif = True
+                break
+
+        if has_tif:
+            regions.append(name)
+
+    # 如果指定了部分流域，则只运行指定流域
+    if ONLY_REGIONS is not None:
+
+        wanted = set(ONLY_REGIONS)
+
+        regions = [
+            r for r in regions
+            if r in wanted
+        ]
+
+    return regions
+
+
+def rebuild_summary_csv():
+    rows = []
+    for p in sorted(Path(STATE_DIR).glob("*.json")):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            continue
+        if not s.get("completed", False):
+            continue
+
+        rows.append({
+            "region": s["region"],
+            "year": s["year"],
+            "willow_pixels_on_cmrset_grid": s.get("willow_pixels", 0),
+            "eta_valid_willow_pixels": s.get("eta_valid_willow_pixels", 0),
+            "eta_missing_willow_pixels": s.get("eta_missing_willow_pixels", 0),
+            "willow_area_m2": s.get("willow_area_m2", 0.0),
+            "willow_area_km2": s.get("willow_area_km2", 0.0),
+            "mean_eta_mm_area_weighted": s.get("mean_eta_mm_area_weighted", None),
+            "total_water_m3": s.get("total_water_m3", 0.0),
+            "downloaded_blocks": s.get("downloaded_blocks", 0),
+            "zero_willow_blocks_skipped": s.get("zero_willow_blocks_skipped", 0),
+            "willow_path": s.get("willow_path", ""),
+        })
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows).sort_values(["region", "year"]).reset_index(drop=True)
+    df.to_csv(SUMMARY_CSV, index=False, encoding="utf-8-sig")
+    print("\nSummary updated:", SUMMARY_CSV)
+
+
+def main():
+    init_earth_engine()
+    regions = discover_regions()
+    if not regions:
+        raise RuntimeError("No regions found. Check ROOT_DIR / CLIP_FOLDER / ONLY_REGIONS.")
+
+    years_to_run = YEARS
+    if ONLY_YEARS is not None:
+        wanted_years = set(ONLY_YEARS)
+        years_to_run = [y for y in YEARS if y in wanted_years]
+
+    print("\nRegions:", len(regions))
+    for r in regions:
+        print("  ", r)
+    print("Years:", years_to_run)
+
+    # 年份放在外层：每年只构建一次 GEE annual image
+    for year in years_to_run:
+        print("\n" + "#" * 78)
+        print(f"BUILD CMRSET ANNUAL ETA: {year}")
+        print("#" * 78)
+
+        ee_annual_image, proj_info, month_count = build_annual_eta(year)
+        print(f"{year} CMRSET monthly images = {month_count}")
+        print("CMRSET reference CRS =", proj_info["crs"])
+        print("CMRSET reference transform =", proj_info["transform"])
+
+        for region in regions:
+            willow_path = os.path.join(
+                ROOT_DIR, region, FILE_TEMPLATE.format(year=year)
+            )
+            if not os.path.exists(willow_path):
+                print(f"⚠️ missing: {region} {year}\n   {willow_path}")
+                continue
+
+            try:
+                process_one_region_year(
+                    region, year, willow_path, ee_annual_image, proj_info
+                )
+                rebuild_summary_csv()
+            except Exception:
+                rebuild_summary_csv()
+                raise
+
+    rebuild_summary_csv()
+    print("\n" + "=" * 78)
+    print("✅ ALL REQUESTED REGION-YEARS COMPLETED")
+    print("=" * 78)
+    print("Summary CSV:", SUMMARY_CSV)
+
+
+if __name__ == "__main__":
+    main()
