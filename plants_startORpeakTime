@@ -1,0 +1,121 @@
+var samples = ee.FeatureCollection('projects/ee-yangshu0024/assets/landsat_spectral_RRG_mdb_300m');
+var mcd = ee.ImageCollection('MODIS/061/MCD12Q2');
+
+var processFeature = function(f) {
+  //1999-09-14 00:00:00+00:00格式用以下两句读取eventDate
+  var rawDate = ee.String(f.get('eventDate')).slice(0, 10);
+  var eventDate = ee.Date(rawDate);
+  
+  //2015/7/1格式用以下一句读取eventDate
+  //var eventDate = ee.Date.parse('YYYY/M/d', f.get('eventDate'));
+  
+  var eventYear = eventDate.get('year');
+  var years = ee.List.sequence(ee.Number(eventYear).subtract(9), eventYear);
+
+  var yearlyFeatures = years.map(function(y) {
+    y = ee.Number(y);
+
+    var base = ee.Dictionary({
+      'system_index': f.get('system:index'),
+      'sample_id': f.get('system:index'),
+      'eventDate': rawDate,//1999-09-14 00:00:00+00:00格式用rawDate；2015/7/1格式用eventDate
+      'year': y,
+      'Greenup_1': -9999,
+      'Peak_1': -9999,
+      'GreenupDate': 'NA',
+      'PeakDate': 'NA'
+    });
+
+    var before2001 = y.lt(2001);
+    var filtered = mcd.filter(ee.Filter.calendarRange(y, y, 'year'));
+    var hasImg = filtered.size().gt(0);
+
+    var values = ee.Dictionary(ee.Algorithms.If(
+      hasImg,
+      ee.Image(filtered.first())
+        .select(['Greenup_1','Peak_1'])
+        .reduceRegion({
+          reducer: ee.Reducer.first(),
+          geometry: f.geometry(),
+          scale: 500,
+          bestEffort: true
+        }),
+      ee.Dictionary({})
+    ));
+
+    // ---- 关键防护：显式替换 null ----
+    var gRaw = values.get('Greenup_1');
+    var g = ee.Number(ee.Algorithms.If(
+      ee.Algorithms.IsEqual(gRaw, null),
+      -9999,
+      gRaw
+    ));
+
+    var pRaw = values.get('Peak_1');
+    var p = ee.Number(ee.Algorithms.If(
+      ee.Algorithms.IsEqual(pRaw, null),
+      -9999,
+      pRaw
+    ));
+
+    var gDate = ee.Algorithms.If(
+      g.eq(-9999),
+      'NA',
+      ee.Date(g.multiply(86400000)).format('YYYY-MM-dd')
+    );
+
+    var pDate = ee.Algorithms.If(
+      p.eq(-9999),
+      'NA',
+      ee.Date(p.multiply(86400000)).format('YYYY-MM-dd')
+    );
+
+    var out = ee.Algorithms.If(
+      before2001,
+      base,
+      base.set('Greenup_1', g)
+          .set('Peak_1', p)
+          .set('GreenupDate', gDate)
+          .set('PeakDate', pDate)
+    );
+
+    return ee.Feature(f.geometry(), ee.Dictionary(out));
+  });
+
+  return ee.FeatureCollection(yearlyFeatures);
+};
+
+var longTable = samples.map(processFeature).flatten();
+
+print('长表示例（前20）', longTable.limit(20));
+
+// 定义一个测试点
+var point = ee.Geometry.Point([145.80060054764434, -35.147932101666974]);
+
+// 载入 MCD12Q2 数据集
+var mcd = ee.ImageCollection('MODIS/061/MCD12Q2');
+
+// 选择感兴趣的波段
+var bands = ['Greenup_1', 'Greenup_2', 'Peak_1', 'Peak_2'];
+
+// 提取点上每年的值
+var table = mcd.map(function(img) {
+  var year = ee.Date(img.get('system:time_start')).get('year');
+  var values = img.select(bands).reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 500
+  });
+  return ee.Feature(point, values.set('year', year));
+});
+
+// 打印结果（前 20 条）
+print('指定点 MCD12Q2 年度物候变量（前20年）', table.limit(20));
+
+Export.table.toDrive({
+  collection: longTable,
+  filefolder:
+  description: 'RRG_Phenology_10yr_long_zoom',
+  fileFormat: 'CSV'
+});
+
